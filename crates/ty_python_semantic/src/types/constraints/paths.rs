@@ -11,8 +11,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use ruff_index::{IndexVec, newtype_index};
 
-use crate::types::constraints::sequents::{Sequent, SequentGroup, SequentMap};
-use crate::types::constraints::variables::Constraint;
+use crate::types::constraints::sequents::{
+    GroupedSequents, InternedSequentConstraint, Sequent, SequentGroup, SequentMap,
+};
 use crate::types::constraints::{
     ConstraintAssignment, ConstraintId, ConstraintSetStorage, Node, NodeId, PathVisitor,
     SourceOrderId, TypeVarId,
@@ -586,7 +587,7 @@ impl PathAssignments {
             db: &'db dyn Db,
             env: &ProgramEnvironment<'db>,
             storage: &mut ConstraintSetStorage<'db>,
-            sequents: &[Sequent<Constraint<'db>>],
+            sequents: &[Sequent<InternedSequentConstraint<'db>>],
             dest: &mut Vec<Sequent<ConstraintId, u16>>,
             antecedents: &mut FxHashMap<ConstraintAssignment, Vec<usize>>,
         ) {
@@ -601,13 +602,13 @@ impl PathAssignments {
 
                 let sequent = match sequent {
                     Sequent::SingleTautology { ante } => {
-                        let ante = storage.intern_constraint(db, env, *ante);
+                        let ante = storage.intern_constraint(db, env, ante.constraint(db));
                         add_antecedent(ante.when_false());
                         Sequent::SingleTautology { ante }
                     }
                     Sequent::PairImpossibility { ante1, ante2 } => {
-                        let ante1 = storage.intern_constraint(db, env, *ante1);
-                        let ante2 = storage.intern_constraint(db, env, *ante2);
+                        let ante1 = storage.intern_constraint(db, env, ante1.constraint(db));
+                        let ante2 = storage.intern_constraint(db, env, ante2.constraint(db));
                         add_antecedent(ante1.when_true());
                         add_antecedent(ante2.when_true());
                         Sequent::PairImpossibility { ante1, ante2 }
@@ -617,9 +618,9 @@ impl PathAssignments {
                         ante2,
                         ante3,
                     } => {
-                        let ante1 = storage.intern_constraint(db, env, *ante1);
-                        let ante2 = storage.intern_constraint(db, env, *ante2);
-                        let ante3 = storage.intern_constraint(db, env, *ante3);
+                        let ante1 = storage.intern_constraint(db, env, ante1.constraint(db));
+                        let ante2 = storage.intern_constraint(db, env, ante2.constraint(db));
+                        let ante3 = storage.intern_constraint(db, env, ante3.constraint(db));
                         add_antecedent(ante1.when_true());
                         add_antecedent(ante2.when_true());
                         add_antecedent(ante3.when_true());
@@ -632,9 +633,9 @@ impl PathAssignments {
                     Sequent::PairImplication {
                         ante1, ante2, post, ..
                     } => {
-                        let ante1 = storage.intern_constraint(db, env, *ante1);
-                        let ante2 = storage.intern_constraint(db, env, *ante2);
-                        let post = storage.intern_constraint(db, env, *post);
+                        let ante1 = storage.intern_constraint(db, env, ante1.constraint(db));
+                        let ante2 = storage.intern_constraint(db, env, ante2.constraint(db));
+                        let post = storage.intern_constraint(db, env, post.constraint(db));
                         add_antecedent(ante1.when_true());
                         add_antecedent(ante2.when_true());
                         let (ante1_depth, _) =
@@ -651,8 +652,8 @@ impl PathAssignments {
                         }
                     }
                     Sequent::SingleImplication { ante, post, .. } => {
-                        let ante = storage.intern_constraint(db, env, *ante);
-                        let post = storage.intern_constraint(db, env, *post);
+                        let ante = storage.intern_constraint(db, env, ante.constraint(db));
+                        let post = storage.intern_constraint(db, env, post.constraint(db));
                         add_antecedent(ante.when_true());
                         let (ante_depth, _) = storage.cached_constraint_bound_depth(db, env, ante);
                         let fuel_cost = storage.sequent_fuel_cost(db, env, post, ante_depth);
@@ -681,11 +682,12 @@ impl PathAssignments {
                         &mut self.sequent_antecedents,
                     );
                 }
-                SequentGroup::Grouped {
-                    equivalence,
-                    leftwards,
-                    rightwards,
-                } => {
+                SequentGroup::Grouped(grouped) => {
+                    let GroupedSequents {
+                        equivalence,
+                        leftwards,
+                        rightwards,
+                    } = grouped.as_ref();
                     let (first, _) = equivalence.in_builder(db, storage);
                     let (first, second) = if first.is_same_typevar_as(db, equivalence.left) {
                         (leftwards, rightwards)
