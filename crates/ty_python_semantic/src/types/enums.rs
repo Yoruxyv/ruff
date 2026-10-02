@@ -322,10 +322,6 @@ pub struct EnumClassLiteral<'db> {
 impl get_size2::GetSize for EnumClassLiteral<'_> {}
 
 impl<'db> ClassLiteral<'db> {
-    pub(crate) fn is_enum_class(self, db: &'db dyn Db) -> bool {
-        self.into_enum_class(db).is_some()
-    }
-
     pub(crate) fn into_enum_class(self, db: &'db dyn Db) -> Option<EnumClassLiteral<'db>> {
         enum_class_literal(db, self)
     }

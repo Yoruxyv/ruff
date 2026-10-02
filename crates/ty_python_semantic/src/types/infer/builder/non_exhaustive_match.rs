@@ -1,3 +1,5 @@
+//! Diagnostics and display-only fixes for non-exhaustive `match` statements.
+
 use std::borrow::Cow;
 
 use itertools::{Either, Itertools};
@@ -9,19 +11,25 @@ use ruff_python_ast as ast;
 use ruff_python_trivia::indentation_at_offset;
 use ruff_source_file::{LineRanges, UniversalNewlineIterator, find_newline};
 use ruff_text_size::{Ranged, TextRange};
-use smallvec::{SmallVec, smallvec_inline};
+use smallvec::SmallVec;
 
 use crate::diagnostic::format_enumeration;
 use crate::types::class::{ClassLiteral, DynamicEnumLiteral};
 use crate::types::display::DisplaySettings;
 use crate::types::enums::enum_member_literals;
+use crate::types::equality::is_same_enum_domain;
 use crate::types::literal::LiteralValueTypeKind;
 use crate::types::{EnumLiteralType, KnownClass, Type, diagnostic::NON_EXHAUSTIVE_MATCH};
-use crate::{Db, ProgramEnvironment};
+use crate::{Db, FxIndexMap, ProgramEnvironment};
 
 use super::TypeInferenceBuilder;
 
 impl<'db> TypeInferenceBuilder<'db, '_> {
+    /// Report values left uncovered by a `match` statement.
+    ///
+    /// `subject_type` is the type at the start of the match; `remaining` is the type left after
+    /// all cases have been considered. The diagnostic identifies individual missing values when
+    /// possible and may provide a display-only fix.
     pub(super) fn report_non_exhaustive_match(
         &self,
         match_statement: &ast::StmtMatch,
@@ -103,20 +111,22 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
 
         if let Some(missing_values) = missing {
-            // Determine whether all `case` branches handle one or more variants
-            // from a single enum.
-            let is_single_enum_subject = match subject_type.expand_top_level_aliases(db, env) {
-                Type::NominalInstance(instance) => {
-                    instance.class_literal(db, env).is_enum_class(db)
-                }
-                Type::EnumComplement(_) => true,
-                ty => ty.as_enum_literal().is_some(),
-            };
+            // If the subject is confined to one enum, its annotations need only member names.
+            let is_single_enum_subject = missing_values
+                .iter()
+                .find_map(|value| value.as_enum_literal())
+                .is_some_and(|member| is_same_enum_domain(db, env, subject_type, member));
 
             let display_settings =
                 DisplaySettings::from_possibly_ambiguous_types(db, env, &missing_values);
 
-            let mut dynamic_enums: Vec<(DynamicEnumLiteral<'_>, SmallVec<[_; 1]>)> = Vec::new();
+            // Functional enum members share a definition instead of having individual ones.
+            // Group their missing names by enum so the second loop can annotate each shared
+            // definition once with all of its displayed missing members. Preserve the order in
+            // which enums are encountered so their related locations in editor diagnostics remain
+            // stable.
+            let mut dynamic_enums: FxIndexMap<DynamicEnumLiteral<'_>, SmallVec<[_; 1]>> =
+                FxIndexMap::default();
 
             for value in missing_values.iter().take(limit) {
                 let Some(member) = value.as_enum_literal() else {
@@ -138,11 +148,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
                             .message(format_args!("enum variant `{name}` is not covered")),
                     );
                 } else if let ClassLiteral::DynamicEnum(class) = member.enum_class(db) {
-                    if let Some((_, names)) = dynamic_enums.iter_mut().find(|(c, _)| *c == class) {
-                        names.push(name);
-                    } else {
-                        dynamic_enums.push((class, smallvec_inline![name]));
-                    }
+                    dynamic_enums.entry(class).or_default().push(name);
                 }
             }
 
@@ -192,6 +198,11 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         }
     }
 
+    /// Suggest a display-only case for the remaining values at the end of the match.
+    ///
+    /// When all remaining values can be enumerated and there are one to five of them, list them as
+    /// alternatives; otherwise use a wildcard. The case body raises `NotImplementedError` as a
+    /// placeholder.
     fn non_exhaustive_match_fix(
         &self,
         match_statement: &ast::StmtMatch,
@@ -268,6 +279,12 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         Some(Fix::display_only_edit(Edit::insertion(insertion, end)))
     }
 
+    /// Find the source range of an enum reference in a pattern for the same enum as `member`.
+    ///
+    /// This searches value patterns and the alternatives inside `|` and `as` patterns. The
+    /// returned range excludes the member name, so the reference can be reused for another member
+    /// in a suggested case. It does not check whether the reference will still resolve to that
+    /// enum when the suggested case runs.
     fn enum_pattern_qualifier(
         &self,
         pattern: &ast::Pattern,
@@ -300,6 +317,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
     }
 }
 
+/// Return whether `ty` represents a single value usable in a match pattern.
+///
+/// This includes `None` and enum literals, but excludes `LiteralString`, which describes many
+/// possible strings.
 fn is_literal_value<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
     if ty.is_none(db) {
         return true;
@@ -319,6 +340,12 @@ fn is_literal_value<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
     }
 }
 
+/// Return whether the subject is recognized as finite by the non-exhaustive-match diagnostic.
+///
+/// This determines whether the diagnostic attempts to list individual uncovered values. Literal
+/// values, unions of recognized finite types, exhaustive enum instances, and enum complements are
+/// recognized. A complement can retain other positive intersection components that prevent its
+/// remaining values from being enumerated by [`finite_values`].
 fn is_finite_match_subject<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -347,6 +374,7 @@ fn is_finite_match_subject<'db>(
     }
 }
 
+/// Return whether `ty`, or an element of a union in `ty`, is a non-literal `enum.Flag` subtype.
 fn contains_flag_instance<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -365,6 +393,12 @@ fn contains_flag_instance<'db>(
     }
 }
 
+/// Enumerate all literal values represented by `ty` when its type shape is supported.
+///
+/// This expands unions, exhaustive enum instances, and enum complements as well as single
+/// literal values. It returns `None` for unsupported shapes and for enum complements whose
+/// remaining members, after applying additional intersection constraints, do not all have literal
+/// types.
 fn finite_values<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,

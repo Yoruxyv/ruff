@@ -36,6 +36,68 @@ help: Add a `case` branch for the remaining values
 note: This is a display-only fix and is likely to be incorrect
 ```
 
+## Concise diagnostics
+
+For a finite subject, the concise message lists missing values when ty can enumerate them.
+Otherwise, it describes the remaining type, or the subject type if it is dynamic.
+
+```py
+from enum import Enum
+from typing import Any, Literal
+
+def one_value(value: Literal[1, 2]) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: value `2` is not covered"
+    match value:
+        case 1:
+            pass
+
+def none(value: Literal[1] | None) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: `None` is not covered"
+    match value:
+        case 1:
+            pass
+
+def several_values(value: Literal[1, 2, 3]) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: values `2` and `3` are not covered"
+    match value:
+        case 1:
+            pass
+
+def many_values(value: Literal[0, 1, 2, 3, 4]) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: values `1`, `2`, `3` and 1 more are not covered"
+    match value:
+        case 0:
+            pass
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+
+def enum(value: Color) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: value `Color.BLUE` is not covered"
+    match value:
+        case Color.RED:
+            pass
+
+def open_type(value: int | str) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: objects of type `str` are not covered"
+    match value:
+        case int():
+            pass
+
+def dynamic(value: Any) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: subject has type `Any`"
+    match value:
+        case 1:
+            pass
+
+def unknown(value) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: subject has type `Unknown`"
+    match value:
+        case 1:
+            pass
+```
+
 ## Enum diagnostics
 
 The diagnostic lists at most three missing members and points to their definitions.
@@ -137,6 +199,131 @@ info: rule `non-exhaustive-match` was selected in the configuration file
 13 +             pass
 14 +         case Direction.SOUTH | Direction.EAST | Direction.WEST | Direction.UP:
 15 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## A union of members of the same enum
+
+The member annotations use unqualified names when the subject contains only members of one enum.
+
+```py
+from enum import Enum
+from typing import Literal
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+    GREEN = 3
+    YELLOW = 4
+
+def describe(value: Literal[Color.RED, Color.BLUE, Color.GREEN]) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case Color.RED:
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.BLUE` and `Color.GREEN` are not covered
+  --> src/mdtest_snippet.py:11:11
+   |
+11 |     match value:  # snapshot: non-exhaustive-match
+   |           ^^^^^ Subject has type `Literal[Color.RED, Color.BLUE, Color.GREEN]`
+   |
+  ::: src/mdtest_snippet.py:6:5
+   |
+ 6 |     BLUE = 2
+   |     ---- enum variant `BLUE` is not covered
+ 7 |     GREEN = 3
+   |     ----- enum variant `GREEN` is not covered
+help: Add a `case` branch for the remaining values
+   |
+12 |         case Color.RED:
+   -             pass
+13 +             pass
+14 +         case Color.BLUE | Color.GREEN:
+15 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## An enum subject narrowed by excluding a member
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+    GREEN = 3
+    YELLOW = 4
+
+def describe(value: Color) -> None:
+    if value is not Color.RED:
+        match value:  # snapshot: non-exhaustive-match
+            case Color.BLUE:
+                pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.GREEN` and `Color.YELLOW` are not covered
+  --> src/mdtest_snippet.py:11:15
+   |
+ 6 |     GREEN = 3
+   |     ----- enum variant `GREEN` is not covered
+ 7 |     YELLOW = 4
+   |     ------ enum variant `YELLOW` is not covered
+ 8 |
+ 9 | def describe(value: Color) -> None:
+10 |     if value is not Color.RED:
+11 |         match value:  # snapshot: non-exhaustive-match
+   |               ^^^^^ Subject has type `Literal[Color.BLUE, Color.GREEN, Color.YELLOW]`
+help: Add a `case` branch for the remaining values
+   |
+12 |             case Color.BLUE:
+   -                 pass
+13 +                 pass
+14 +             case Color.GREEN | Color.YELLOW:
+15 +                 raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## An enum subject narrowed by truthiness
+
+When ty cannot enumerate the remaining values after truthiness narrowing, it describes their type.
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 0
+    BLUE = 1
+    GREEN = 2
+
+    def __bool__(self) -> bool:
+        return self.value != 0
+
+def describe(value: Color) -> None:
+    if value:
+        match value:  # snapshot: non-exhaustive-match
+            case Color.BLUE:
+                pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: objects of type `Color & ~AlwaysFalsy & ~Literal[Color.BLUE]` are not covered
+  --> src/mdtest_snippet.py:13:15
+   |
+13 |         match value:  # snapshot: non-exhaustive-match
+   |               ^^^^^ Subject has type `Color & ~AlwaysFalsy`
+help: Add a `case` branch for the remaining values
+   |
+14 |             case Color.BLUE:
+   -                 pass
+15 +                 pass
+16 +             case _:
+17 +                 raise NotImplementedError("TODO")
    |
 note: This is a display-only fix and is likely to be incorrect
 ```
@@ -357,6 +544,45 @@ help: Add a `case` branch for the remaining values
    -             pass
 9  +             pass
 10 +         case Color.GREEN | Color.BLUE | "stop":
+11 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## Multiple functional enums
+
+The diagnostic groups missing members by enum definition in its annotations.
+
+```py
+from enum import Enum
+
+Color = Enum("Color", "RED GREEN BLUE")
+Direction = Enum("Direction", "NORTH SOUTH")
+
+def describe(value: Color | Direction) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case Color.RED | Direction.NORTH:
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.GREEN`, `Color.BLUE` and `Direction.SOUTH` are not covered
+ --> src/mdtest_snippet.py:7:11
+  |
+3 | Color = Enum("Color", "RED GREEN BLUE")
+  |                       ---------------- Enum variants `Color.GREEN` and `Color.BLUE` are not covered
+4 | Direction = Enum("Direction", "NORTH SOUTH")
+  |                               ------------- Enum variant `Direction.SOUTH` is not covered
+5 |
+6 | def describe(value: Color | Direction) -> None:
+7 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Direction`
+help: Add a `case` branch for the remaining values
+   |
+8  |         case Color.RED | Direction.NORTH:
+   -             pass
+9  +             pass
+10 +         case Color.GREEN | Color.BLUE | Direction.SOUTH:
 11 +             raise NotImplementedError("TODO")
    |
 note: This is a display-only fix and is likely to be incorrect
