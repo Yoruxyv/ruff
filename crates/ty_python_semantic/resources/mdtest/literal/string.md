@@ -19,3 +19,10 @@ reveal_type("You say \"hey\" back")  # fmt: skip
 
 reveal_type('No "closure here')  # revealed: Literal["No \"closure here"]
 ```
+
+## Escaped characters
+
+```py
+reveal_type("\x1b\u200b\U000e0001")  # revealed: Literal["\x1b\u200b\U000e0001"]
+reveal_type('a"b\x00')  # revealed: Literal["a\"b\x00"]
+```

@@ -1156,6 +1156,51 @@ fn redundant_elif_fix_preserves_line_endings_and_checks_cleanly() -> anyhow::Res
 }
 
 #[test]
+fn non_exhaustive_match_fix_escapes_string_literals() -> anyhow::Result<()> {
+    let registry = crate::default_lint_registry();
+    let mut rules = RuleSelection::from_registry(registry);
+    rules.enable(
+        registry.get("non-exhaustive-match")?,
+        Severity::Warning,
+        LintSource::File,
+    );
+    let mut db = TestDbBuilder::new()
+        .with_python_version(PythonVersion::PY311)
+        .with_rule_selection(rules)
+        .build()?;
+    let source = concat!(
+        "from typing import Literal\n\n",
+        r#"def describe(value: Literal["handled", "\x1b", "\u200b", "\U000e0001", 'a"b']) -> None:"#,
+        "\n    match value:\n        case \"handled\":\n            pass\n",
+    );
+    db.write_file("/src/main.py", source)?;
+    let file = system_path_to_file(&db, "/src/main.py")?;
+    let diagnostics = check_types(&db, program_file(&db, file));
+    let [diagnostic] = diagnostics.as_slice() else {
+        anyhow::bail!("expected one diagnostic: {diagnostics:#?}");
+    };
+    let fix = diagnostic
+        .fix()
+        .ok_or_else(|| anyhow::anyhow!("expected a suggested case"))?;
+    let [edit] = fix.edits() else {
+        anyhow::bail!("expected a single edit");
+    };
+    assert_eq!(
+        edit.content(),
+        Some(concat!(
+            r#"        case "\x1b" | "\u200b" | "\U000e0001" | "a\"b":"#,
+            "\n            raise NotImplementedError(\"TODO\")\n",
+        ))
+    );
+    let mut fixed = source.to_owned();
+    fixed.replace_range(edit.range().to_std_range(), edit.content().unwrap_or(""));
+    ruff_python_parser::parse_module(&fixed)?;
+    db.write_file("/src/main.py", fixed)?;
+    assert_file_diagnostics(&db, "/src/main.py", &[]);
+    Ok(())
+}
+
+#[test]
 fn function_inference_regions_are_disjoint() -> anyhow::Result<()> {
     let mut db = setup_db();
     db.write_dedented(

@@ -3629,6 +3629,7 @@ dependencies = [
  "icu_properties",
  "itertools 0.15.0",
  "ruff_python_ast",
+ "test-case",
 ]
 
 [[package]]

@@ -902,6 +902,18 @@ help: Add a `case` branch for the remaining values
 note: This is a display-only fix and is likely to be incorrect
 ```
 
+## Escaped string literals
+
+```py
+from typing import Literal
+
+def describe(value: Literal["handled", "\x1b", "\u200b", "\U000e0001"]) -> None:
+    # error: [non-exhaustive-match] "Match is not exhaustive: values `"\x1b"`, `"\u200b"` and `"\U000e0001"` are not covered"
+    match value:
+        case "handled":
+            pass
+```
+
 ## Byte literals
 
 ```py

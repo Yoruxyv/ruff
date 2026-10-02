@@ -106,7 +106,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             "Subject has type `{subject_type_display}`",
         ));
 
-        if subject_type.is_dynamic() {
+        if subject_type.is_dynamic() || subject_type.is_equivalent_to(db, env, remaining) {
             diagnostic.set_concise_message(format_args!(
                 "Match is not exhaustive: subject has type `{subject_type_display}`",
             ));

@@ -58,6 +58,28 @@ impl<'a> UnicodeEscape<'a> {
         let layout = Self::repr_layout(source, quote);
         Self { source, layout }
     }
+
+    /// Create an escaper that uses the specified quote as the string's outer delimiter, even when
+    /// the other quote would require fewer escapes.
+    pub fn with_fixed_quote(source: &'a str, quote: Quote) -> Self {
+        let mut layout = Self::repr_layout(source, quote);
+        if layout.quote != quote {
+            // `repr_layout` switches quotes only when the preferred quote occurs and the other
+            // does not, so switching back adds one escape for each preferred quote.
+            layout.quote = quote;
+            layout.len = layout.len.and_then(|len| {
+                len.checked_add(
+                    source
+                        .bytes()
+                        .filter(|&byte| byte == quote.as_byte())
+                        .count(),
+                )
+                .filter(|&len| len <= isize::MAX as usize - Self::REPR_RESERVED_LEN)
+            });
+        }
+        Self { source, layout }
+    }
+
     #[inline]
     pub fn new_repr(source: &'a str) -> Self {
         Self::with_preferred_quote(source, Quote::Single)
@@ -400,6 +422,8 @@ impl std::fmt::Display for BytesRepr<'_, '_> {
 
 #[cfg(test)]
 mod unicode_escape_tests {
+    use test_case::test_case;
+
     use super::*;
 
     #[test]
@@ -413,5 +437,19 @@ mod unicode_escape_tests {
 
         assert!(test("'\"hello"));
         assert!(test("hello\n"));
+    }
+
+    #[test_case("hello", Quote::Double, "\"hello\""; "no escapes")]
+    #[test_case("a\"b", Quote::Double, "\"a\\\"b\""; "double quote")]
+    #[test_case("a'\"b", Quote::Double, "\"a'\\\"b\""; "both quotes")]
+    #[test_case("a'b", Quote::Single, "'a\\'b'"; "single quote")]
+    #[test_case("\x1b", Quote::Double, "\"\\x1b\""; "control character")]
+    fn fixed_quote(source: &str, quote: Quote, expected: &str) {
+        let escaped = UnicodeEscape::with_fixed_quote(source, quote);
+        assert_eq!(escaped.layout().len, Some(expected.len() - 2));
+        assert_eq!(
+            escaped.str_repr(TripleQuotes::No).to_string().as_deref(),
+            Some(expected)
+        );
     }
 }
