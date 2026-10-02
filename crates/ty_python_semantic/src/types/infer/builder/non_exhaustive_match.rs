@@ -18,12 +18,13 @@ use ty_python_core::place::PlaceExprRef;
 use crate::diagnostic::format_enumeration;
 use crate::importer::ImportRequest;
 use crate::types::class::{ClassLiteral, DynamicEnumLiteral};
+use crate::types::cyclic::{ActiveRecursionDetector, TypeIdentity};
 use crate::types::display::DisplaySettings;
 use crate::types::enums::enum_member_literals;
 use crate::types::equality::is_same_enum_domain;
 use crate::types::literal::LiteralValueTypeKind;
 use crate::types::{EnumLiteralType, KnownClass, Type, diagnostic::NON_EXHAUSTIVE_MATCH};
-use crate::{Db, FxIndexMap, ProgramEnvironment};
+use crate::{Db, FxIndexMap, FxIndexSet, ProgramEnvironment};
 
 use super::TypeInferenceBuilder;
 
@@ -399,9 +400,10 @@ fn is_literal_value<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
 /// Return whether the subject is recognized as finite by the non-exhaustive-match diagnostic.
 ///
 /// This determines whether the diagnostic attempts to list individual uncovered values. Literal
-/// values, unions of recognized finite types, exhaustive enum instances, and enum complements are
-/// recognized. A complement can retain other positive intersection components that prevent its
-/// remaining values from being enumerated by [`finite_values`].
+/// values, unions of recognized finite types, enum instances whose members cover all their possible
+/// values, and enum complements are recognized. An intersection is finite when any of its positive
+/// components is finite. Type variables are recognized when their bounds or constraints can be
+/// enumerated, and `NewType` instances are recognized when their bases can be enumerated.
 fn is_finite_match_subject<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
@@ -419,11 +421,18 @@ fn is_finite_match_subject<'db>(
             .iter()
             .all(|element| is_finite_match_subject(db, env, *element)),
 
+        Type::Intersection(intersection) => intersection
+            .positive(db)
+            .iter()
+            .any(|element| is_finite_match_subject(db, env, *element)),
+
         Type::NominalInstance(instance) => {
             enum_member_literals(db, instance.class_literal(db, env), None).is_some()
         }
 
         Type::EnumComplement(_) => true,
+
+        Type::TypeVar(_) | Type::NewTypeInstance(_) => finite_values(db, env, ty).is_some(),
 
         _ => false,
     }
@@ -448,45 +457,127 @@ fn contains_flag_instance<'db>(
     }
 }
 
-/// Enumerate all literal values represented by `ty` when its type shape is supported.
+/// Enumerate the possible literal values of `ty` when its type shape is supported.
 ///
-/// This expands unions, exhaustive enum instances, and enum complements as well as single
-/// literal values. It returns `None` for unsupported shapes and for enum complements whose
-/// remaining members, after applying additional intersection constraints, do not all have literal
-/// types.
+/// This expands unions, enum instances whose members cover all their possible values, enum
+/// complements, and intersections with a finite positive component as well as single literal
+/// values. Type aliases, type-variable bounds, constraints, and `NewType` bases are expanded. Values
+/// that cannot be proven disjoint from an intersection are retained, even if they might not satisfy
+/// all its constraints. A type-variable bound or its constraints can include values that are absent
+/// from a particular specialization. Returns `None` when enumeration cannot be completed.
 fn finite_values<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
     ty: Type<'db>,
 ) -> Option<Vec<Type<'db>>> {
-    let ty = ty.expand_top_level_aliases(db, env);
+    /// Enumerate `ty`, returning `None` if its type identity is already being expanded.
+    fn visit<'db>(
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        ty: Type<'db>,
+        active: &ActiveRecursionDetector<TypeIdentity<'db>>,
+    ) -> Option<Vec<Type<'db>>> {
+        active.visit(
+            &ty.to_type_identity(db),
+            || None,
+            || match ty {
+                Type::Union(union) => {
+                    let elements = union.elements(db);
+                    // Multiple intersection arms can contain the same value. Keep its first occurrence
+                    // so the diagnostic lists each value once in a stable order.
+                    let mut values = FxIndexSet::default();
+                    for element in elements {
+                        values.extend(visit(db, env, *element, active)?);
+                    }
+                    Some(values.into_iter().collect())
+                }
 
-    if is_literal_value(db, ty) {
-        return Some(vec![ty]);
+                Type::Intersection(intersection) => {
+                    let candidates = intersection
+                        .positive(db)
+                        .iter()
+                        .find_map(|element| visit(db, env, *element, active))?;
+                    Some(
+                        candidates
+                            .into_iter()
+                            .filter(|candidate| !candidate.is_disjoint_from(db, env, ty))
+                            .collect(),
+                    )
+                }
+
+                Type::NominalInstance(_) if ty.is_none(db) => Some(vec![ty]),
+
+                Type::NominalInstance(instance) => {
+                    Some(enum_member_literals(db, instance.class_literal(db, env), None)?.collect())
+                }
+
+                Type::LiteralValue(literal) => match literal.kind() {
+                    LiteralValueTypeKind::Int(_)
+                    | LiteralValueTypeKind::Bool(_)
+                    | LiteralValueTypeKind::String(_)
+                    | LiteralValueTypeKind::Bytes(_)
+                    | LiteralValueTypeKind::Enum(_) => Some(vec![ty]),
+                    LiteralValueTypeKind::LiteralString => None,
+                },
+
+                Type::EnumComplement(complement) => {
+                    let mut values = Vec::new();
+                    for value in complement.remaining_literal_types(db, env) {
+                        if !value.is_never() {
+                            values.extend(visit(db, env, value, active)?);
+                        }
+                    }
+                    Some(values)
+                }
+
+                Type::TypeAlias(alias) => visit(db, env, alias.value_type(db), active),
+
+                Type::Recursive(recursive) => {
+                    let unfolded = recursive
+                        .unfold(db, &recursive.environment(db))
+                        .into_unfolded()?;
+                    visit(db, env, unfolded, active)
+                }
+
+                Type::TypeVar(typevar) => {
+                    let bounds = typevar.typevar(db).bound_or_constraints(db, env)?;
+                    visit(db, env, bounds.as_type(db, env), active)
+                }
+
+                Type::NewTypeInstance(newtype) => {
+                    visit(db, env, newtype.concrete_base_type(db), active)
+                }
+
+                Type::Dynamic(_)
+                | Type::Divergent(_)
+                | Type::RecursiveVar(_)
+                | Type::Never
+                | Type::FunctionLiteral(_)
+                | Type::BoundMethod(_)
+                | Type::KnownBoundMethod(_)
+                | Type::WrapperDescriptor(_)
+                | Type::DataclassDecorator(_)
+                | Type::DataclassTransformer(_)
+                | Type::Callable(_)
+                | Type::ModuleLiteral(_)
+                | Type::ClassLiteral(_)
+                | Type::GenericAlias(_)
+                | Type::SubclassOf(_)
+                | Type::ProtocolInstance(_)
+                | Type::SpecialForm(_)
+                | Type::KnownInstance(_)
+                | Type::PropertyInstance(_)
+                | Type::SlotDescriptor(_)
+                | Type::AlwaysTruthy
+                | Type::AlwaysFalsy
+                | Type::BoundSuper(_)
+                | Type::TypeIs(_)
+                | Type::TypeGuard(_)
+                | Type::TypeForm(_)
+                | Type::TypedDict(_) => None,
+            },
+        )
     }
 
-    match ty {
-        Type::Union(union) => {
-            let elements = union.elements(db);
-            let mut values = Vec::with_capacity(elements.len());
-            for element in elements {
-                values.extend(finite_values(db, env, *element)?);
-            }
-            Some(values)
-        }
-
-        Type::NominalInstance(instance) => {
-            Some(enum_member_literals(db, instance.class_literal(db, env), None)?.collect())
-        }
-
-        Type::EnumComplement(complement) => {
-            let values = complement.remaining_literal_types(db, env);
-            values
-                .iter()
-                .all(|value| is_literal_value(db, *value))
-                .then_some(values)
-        }
-
-        _ => None,
-    }
+    visit(db, env, ty, &ActiveRecursionDetector::default())
 }

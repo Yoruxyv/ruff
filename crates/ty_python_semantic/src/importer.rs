@@ -670,7 +670,7 @@ impl ImportAction {
     /// Usually this is identical to the symbol text given to the corresponding
     /// [`ImportRequest`], but this may sometimes be fully qualified based on
     /// existing imports or import preferences.
-    pub fn into_symbol_text(self) -> Box<str> {
+    pub(crate) fn into_symbol_text(self) -> Box<str> {
         self.symbol_text
     }
 }
