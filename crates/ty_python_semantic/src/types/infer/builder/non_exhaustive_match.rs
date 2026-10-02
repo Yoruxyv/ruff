@@ -10,10 +10,13 @@ use ruff_diagnostics::{Edit, Fix};
 use ruff_python_ast as ast;
 use ruff_python_trivia::indentation_at_offset;
 use ruff_source_file::{LineRanges, UniversalNewlineIterator, find_newline};
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::{Ranged, TextSize};
 use smallvec::SmallVec;
+use ty_module_resolver::file_to_module;
+use ty_python_core::place::PlaceExprRef;
 
 use crate::diagnostic::format_enumeration;
+use crate::importer::ImportRequest;
 use crate::types::class::{ClassLiteral, DynamicEnumLiteral};
 use crate::types::display::DisplaySettings;
 use crate::types::enums::enum_member_literals;
@@ -200,9 +203,10 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
 
     /// Suggest a display-only case for the remaining values at the end of the match.
     ///
-    /// When all remaining values can be enumerated and there are one to five of them, list them as
-    /// alternatives; otherwise use a wildcard. The case body raises `NotImplementedError` as a
-    /// placeholder.
+    /// List the remaining values as alternatives when all can be enumerated and there are one to
+    /// five of them. If any is an enum member, the match must also have no guards and every enum
+    /// class must have an existing, unshadowed runtime reference. Otherwise, use a wildcard. The
+    /// case body raises `NotImplementedError` as a placeholder.
     fn non_exhaustive_match_fix(
         &self,
         match_statement: &ast::StmtMatch,
@@ -250,24 +254,27 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             line_ending
         };
 
+        // A guard can change an enum reference before the suggested case is reached.
+        let has_guard = match_statement
+            .cases
+            .iter()
+            .any(|case| case.guard.is_some());
+
         let pattern = finite_values(db, env, remaining)
             .filter(|values| !values.is_empty() && values.len() <= 5)
-            .map(|values| {
+            .and_then(|values| {
                 values
                     .into_iter()
-                    .map(|value| {
-                        if let Some(member) = value.as_enum_literal()
-                            && let Some(qualifier) = match_statement
-                                .cases
-                                .iter()
-                                .find_map(|case| self.enum_pattern_qualifier(&case.pattern, member))
-                        {
-                            format!("{}.{}", &source[qualifier], member.name(db))
-                        } else {
-                            value.display_literal_value(db, env).to_string()
+                    .map(|value| match value.as_enum_literal() {
+                        Some(_) if has_guard => None,
+                        Some(member) => {
+                            let qualifier = self.enum_qualifier(member, match_statement.start())?;
+                            Some(Either::Left(format!("{qualifier}.{}", member.name(db))))
                         }
+                        None => Some(Either::Right(value.display_literal_value(db, env))),
                     })
-                    .join(" | ")
+                    .collect::<Option<Vec<_>>>()
+                    .map(|patterns| patterns.into_iter().join(" | "))
             })
             .unwrap_or_else(|| "_".to_string());
 
@@ -279,41 +286,90 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
         Some(Fix::display_only_edit(Edit::insertion(insertion, end)))
     }
 
-    /// Find the source range of an enum reference in a pattern for the same enum as `member`.
+    /// Find an in-scope reference to the enum class for a suggested case.
     ///
-    /// This searches value patterns and the alternatives inside `|` and `as` patterns. The
-    /// returned range excludes the member name, so the reference can be reused for another member
-    /// in a suggested case. It does not check whether the reference will still resolve to that
-    /// enum when the suggested case runs.
-    fn enum_pattern_qualifier(
+    /// Reuse a local definition or an existing runtime import, including an import alias. Return
+    /// `None` if the reference has a visible shadowing or reassignment, or needs a new import.
+    fn enum_qualifier(
         &self,
-        pattern: &ast::Pattern,
         member: EnumLiteralType<'db>,
-    ) -> Option<TextRange> {
+        at: TextSize,
+    ) -> Option<impl std::fmt::Display + 'db> {
         let db = self.db();
+        let class = member.enum_class(db);
+        let definition = class.definition(db)?;
 
-        match pattern {
-            ast::Pattern::MatchValue(value)
-                if let ast::Expr::Attribute(attribute) = &*value.value
-                    && let Some(expression_type) = self.try_expression_type(&value.value)
-                    && let Some(enum_literal) = expression_type.as_enum_literal()
-                    && enum_literal.enum_class_literal(db) == member.enum_class_literal(db) =>
-            {
-                Some(attribute.value.range())
+        if definition.file(db) == self.file() {
+            let definition_scope = definition.file_scope(db);
+            let symbol_id = definition.place(db).as_symbol()?;
+            let symbol = self.index.place_table(definition_scope).symbol(symbol_id);
+            let name = symbol.name();
+
+            if definition.full_range(db, self.module()).end() > at {
+                return None;
             }
 
-            ast::Pattern::MatchOr(or) => or
-                .patterns
-                .iter()
-                .find_map(|pattern| self.enum_pattern_qualifier(pattern, member)),
+            let (scope, id, symbol) = self
+                .index
+                .visible_ancestor_scopes(self.scope().file_scope_id(db))
+                .find_map(|(scope, _)| {
+                    let places = self.index.place_table(scope);
+                    let id = places.symbol_id(name)?;
+                    let symbol = places.symbol(id);
+                    (symbol.is_bound() || symbol.is_declared()).then_some((scope, id, symbol))
+                })?;
 
-            ast::Pattern::MatchAs(as_pattern) => as_pattern
-                .pattern
-                .as_deref()
-                .and_then(|pattern| self.enum_pattern_qualifier(pattern, member)),
+            if scope != definition_scope || symbol.is_reassigned() {
+                return None;
+            }
 
-            _ => None,
+            let mut bindings = self
+                .index
+                .use_def_map(scope)
+                .end_of_scope_symbol_bindings(id);
+
+            if bindings.next()?.binding.definition() != Some(definition) {
+                return None;
+            }
+
+            return bindings.next().is_none().then_some(Either::Left(name));
         }
+
+        if !definition.file_scope(db).is_global() {
+            return None;
+        }
+
+        let module = file_to_module(db, class.program_file(db).resolver_file(db))?;
+        let name = definition.name(db)?;
+
+        let action = self.context.importer().import_for_diagnostic(
+            ImportRequest::import_from(module.name(db), &name),
+            self.scope().file_scope_id(db),
+            at,
+        )?;
+
+        if action.import().is_some() {
+            return None;
+        }
+
+        let qualifier = action.into_symbol_text();
+
+        for member in self
+            .index
+            .visible_ancestor_scopes(self.scope().file_scope_id(db))
+            .flat_map(|(scope, _)| self.index.place_table(scope).members())
+        {
+            if !PlaceExprRef::from(member).is_bound() {
+                continue;
+            }
+
+            let bound = member.to_string();
+            if *qualifier == *bound || qualifier.starts_with(&format!("{bound}.")) {
+                return None;
+            }
+        }
+
+        Some(Either::Right(qualifier))
     }
 }
 
@@ -363,10 +419,9 @@ fn is_finite_match_subject<'db>(
             .iter()
             .all(|element| is_finite_match_subject(db, env, *element)),
 
-        Type::NominalInstance(instance) => instance
-            .class_literal(db, env)
-            .into_enum_class(db)
-            .is_some_and(|class| class.members_are_exhaustive(db)),
+        Type::NominalInstance(instance) => {
+            enum_member_literals(db, instance.class_literal(db, env), None).is_some()
+        }
 
         Type::EnumComplement(_) => true,
 

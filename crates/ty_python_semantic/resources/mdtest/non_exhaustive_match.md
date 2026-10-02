@@ -695,6 +695,420 @@ help: Add a `case` branch for the remaining values
 note: This is a display-only fix and is likely to be incorrect
 ```
 
+## An enum import alias without an enum case
+
+`colors.py`:
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+```
+
+```py
+from typing import Literal
+from colors import Color as Hue
+
+def describe(value: Hue | Literal["stop"]) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:5:11
+  |
+5 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+  |
+ ::: src/colors.py:4:5
+  |
+4 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+5 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+help: Add a `case` branch for the remaining values
+  |
+6 |         case "stop":
+  -             pass
+7 +             pass
+8 +         case Hue.RED | Hue.BLUE:
+9 +             raise NotImplementedError("TODO")
+  |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## A module import alias without an enum case
+
+`colors.py`:
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+```
+
+```py
+from typing import Literal
+import colors as palette
+
+def describe(value: palette.Color | Literal["stop"]) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:5:11
+  |
+5 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+  |
+ ::: src/colors.py:4:5
+  |
+4 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+5 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+help: Add a `case` branch for the remaining values
+  |
+6 |         case "stop":
+  -             pass
+7 +             pass
+8 +         case palette.Color.RED | palette.Color.BLUE:
+9 +             raise NotImplementedError("TODO")
+  |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## An enum name rebound in a guard
+
+`colors.py`:
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+```
+
+```py
+from typing import Literal
+from colors import Color as Hue
+
+def describe(value: Hue | Literal["stop"]) -> None:
+    global Hue
+    match value:  # snapshot: non-exhaustive-match
+        case Hue.RED if Hue := None:  # ty: ignore[unresolved-attribute]
+            pass
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:6:11
+  |
+6 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+  |
+ ::: src/colors.py:4:5
+  |
+4 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+5 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+help: Add a `case` branch for the remaining values
+   |
+9  |         case "stop":
+   -             pass
+10 +             pass
+11 +         case _:
+12 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## An enum on a module rebound before a match
+
+`colors.py`:
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+```
+
+```py
+from typing import Literal
+import colors as palette
+
+def describe(value: palette.Color | Literal["stop"]) -> None:
+    palette.Color = None  # ty: ignore[invalid-assignment]
+    match value:  # snapshot: non-exhaustive-match
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:6:11
+  |
+6 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+  |
+ ::: src/colors.py:4:5
+  |
+4 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+5 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+help: Add a `case` branch for the remaining values
+   |
+7  |         case "stop":
+   -             pass
+8  +             pass
+9  +         case _:
+10 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## An enum on a module rebound by a guard function
+
+`colors.py`:
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+```
+
+```py
+from typing import Literal
+import colors as palette
+
+def rebind() -> bool:
+    palette.Color = None  # ty: ignore[invalid-assignment]
+    return False
+
+def describe(value: palette.Color | Literal["stop"]) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case palette.Color.RED if rebind():
+            pass
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:9:11
+  |
+9 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+  |
+ ::: src/colors.py:4:5
+  |
+4 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+5 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+help: Add a `case` branch for the remaining values
+   |
+12 |         case "stop":
+   -             pass
+13 +             pass
+14 +         case _:
+15 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## A type-only enum import
+
+`colors.py`:
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+```
+
+```py
+from __future__ import annotations
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from colors import Color as Hue
+
+def describe(value: Hue | Literal["stop"]) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:8:11
+  |
+8 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+  |
+ ::: src/colors.py:4:5
+  |
+4 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+5 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+help: Add a `case` branch for the remaining values
+   |
+9  |         case "stop":
+   -             pass
+10 +             pass
+11 +         case _:
+12 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## A shadowed enum import
+
+`colors.py`:
+
+```py
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+```
+
+```py
+from typing import Literal
+from colors import Color as Hue
+
+def describe(value: Hue | Literal["stop"], Hue: int) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:5:11
+  |
+5 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+  |
+ ::: src/colors.py:4:5
+  |
+4 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+5 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+help: Add a `case` branch for the remaining values
+  |
+6 |         case "stop":
+  -             pass
+7 +             pass
+8 +         case _:
+9 +             raise NotImplementedError("TODO")
+  |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## An enum defined in the same file
+
+```py
+from enum import Enum
+from typing import Literal
+
+class Color(Enum):
+    RED = 1
+    BLUE = 2
+
+def describe(value: Color | Literal["stop"]) -> None:
+    match value:  # snapshot: non-exhaustive-match
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+ --> src/mdtest_snippet.py:9:11
+  |
+5 |     RED = 1
+  |     --- enum variant `Color.RED` is not covered
+6 |     BLUE = 2
+  |     ---- enum variant `Color.BLUE` is not covered
+7 |
+8 | def describe(value: Color | Literal["stop"]) -> None:
+9 |     match value:  # snapshot: non-exhaustive-match
+  |           ^^^^^ Subject has type `Color | Literal["stop"]`
+help: Add a `case` branch for the remaining values
+   |
+10 |         case "stop":
+   -             pass
+11 +             pass
+12 +         case Color.RED | Color.BLUE:
+13 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
+## An enum defined in a function
+
+```py
+from enum import Enum
+from typing import Literal, cast
+
+def describe(value: object) -> None:
+    class Color(Enum):
+        RED = 1
+        BLUE = 2
+
+    narrowed = cast(Color | Literal["stop"], value)
+    match narrowed:  # snapshot: non-exhaustive-match
+        case "stop":
+            pass
+```
+
+```snapshot
+error[non-exhaustive-match]: Match is not exhaustive: values `Color.RED` and `Color.BLUE` are not covered
+  --> src/mdtest_snippet.py:10:11
+   |
+ 6 |         RED = 1
+   |         --- enum variant `Color.RED` is not covered
+ 7 |         BLUE = 2
+   |         ---- enum variant `Color.BLUE` is not covered
+ 8 |
+ 9 |     narrowed = cast(Color | Literal["stop"], value)
+10 |     match narrowed:  # snapshot: non-exhaustive-match
+   |           ^^^^^^^^ Subject has type `Color | Literal["stop"]`
+help: Add a `case` branch for the remaining values
+   |
+11 |         case "stop":
+   -             pass
+12 +             pass
+13 +         case Color.RED | Color.BLUE:
+14 +             raise NotImplementedError("TODO")
+   |
+note: This is a display-only fix and is likely to be incorrect
+```
+
 ## Enums with the same name
 
 `first.py`:
